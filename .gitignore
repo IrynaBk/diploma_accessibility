@@ -1,0 +1,27 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local DEM caches
+.dem_cache/
+.fabdem_cache/
+
+# Trained model binaries can be large; keep them local unless explicitly needed
+models/
+
+# Temporary validation output
+aggregate_test/
+test_*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
