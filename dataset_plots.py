@@ -14,9 +14,22 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
+
+ACCESSIBILITY_FIELDS = (
+    "surface",
+    "smoothness",
+    "width_m",
+    "incline_percent",
+    "wheelchair",
+    "kerb",
+    "ramp",
+    "sidewalk",
+    "tactile_paving",
+)
 
 FEATURES = (
     "surface",
@@ -69,6 +82,63 @@ def known_value(edge: Dict[str, Any], feature: str) -> Any:
             value = features.get("dem", {}).get("dem_incline_percent")
         return value
     return features.get(feature)
+
+
+def value_is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized in {"unknown", "none", "null", "nan", "n/a", "na", "not_available", "not available"}
+    return False
+
+
+def normalize_area_type(area_id: Optional[str]) -> str:
+    if area_id is None:
+        return "unknown"
+    area_key = str(area_id).strip().lower()
+    if area_key in {"central_dense", "dense_central"}:
+        return "central"
+    return area_key
+
+
+def compute_missingness_summary(edges: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        normalized_area = normalize_area_type(edge.get("area_id"))
+        group_key = (edge.get("city_id", "unknown"), normalized_area)
+        grouped[group_key].append(edge)
+
+    summary: List[Dict[str, Any]] = []
+    for (city_id, area_id), group_edges in sorted(grouped.items()):
+        totals = {field: 0 for field in ACCESSIBILITY_FIELDS}
+        missing = {field: 0 for field in ACCESSIBILITY_FIELDS}
+
+        for edge in group_edges:
+            for field in ACCESSIBILITY_FIELDS:
+                value = known_value(edge, field)
+                totals[field] += 1
+                if value_is_missing(value):
+                    missing[field] += 1
+
+        field_rates = {}
+        for field in ACCESSIBILITY_FIELDS:
+            count = totals[field]
+            if count:
+                field_rates[field] = missing[field] / count
+            else:
+                field_rates[field] = 0.0
+
+        mean_missing_rate = float(np.mean(list(field_rates.values()))) if field_rates else 0.0
+        summary.append({
+            "city_id": city_id,
+            "area_id": area_id,
+            "total_edges": len(group_edges),
+            "mean_missing_rate": mean_missing_rate,
+            "field_rates": field_rates,
+        })
+
+    return summary
 
 
 def save_figure(figure: plt.Figure, output_dir: Path, name: str) -> None:
@@ -131,16 +201,69 @@ def plot_city_distributions(city_id: str, edges: List[Dict[str, Any]], output_di
     save_figure(figure, output_dir, f"{city_id}_numeric_distributions.png")
 
 
+def plot_missingness_heatmap(summary: List[Dict[str, Any]], output_dir: Path) -> None:
+    city_order = sorted({row["city_id"] for row in summary})
+    area_order = sorted({row["area_id"] for row in summary})
+    matrix = np.full((len(city_order), len(area_order)), np.nan, dtype=float)
+
+    row_index = {city: idx for idx, city in enumerate(city_order)}
+    col_index = {area: idx for idx, area in enumerate(area_order)}
+
+    for row in summary:
+        i = row_index[row["city_id"]]
+        j = col_index[row["area_id"]]
+        matrix[i, j] = row["mean_missing_rate"]
+
+    figure, ax = plt.subplots(figsize=(max(8, len(area_order) * 1.6), max(5, len(city_order) * 0.9)))
+    image = ax.imshow(matrix, cmap="YlOrRd", vmin=0.0, vmax=1.0, aspect="auto")
+    ax.set_xticks(range(len(area_order)))
+    ax.set_xticklabels(area_order, rotation=35, ha="right")
+    ax.set_yticks(range(len(city_order)))
+    ax.set_yticklabels(city_order)
+    ax.set_title("Missing accessibility attributes by city and area type")
+    ax.set_xlabel("Area type")
+    ax.set_ylabel("City")
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            value = matrix[i, j]
+            if np.isnan(value):
+                text = "n/a"
+            else:
+                text = f"{value * 100:.0f}%"
+            ax.text(j, i, text, ha="center", va="center", color="black", fontsize=8)
+
+    colorbar = figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Missing rate (fraction)")
+    save_figure(figure, output_dir, "accessibility_missingness_by_city_area.png")
+
+
+def print_missingness_report(summary: List[Dict[str, Any]]) -> None:
+    print("\nAccessibility missingness report (by city and area type)")
+    for row in sorted(summary, key=lambda item: (item["city_id"], item["area_id"])):
+        print(
+            f"{row['city_id']} | {row['area_id']} | edges={row['total_edges']:,} | "
+            f"mean missing rate={row['mean_missing_rate'] * 100:.1f}%"
+        )
+        for field, rate in sorted(row["field_rates"].items(), key=lambda item: item[1], reverse=True):
+            print(f"  - {field}: {rate * 100:.1f}% missing")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot descriptive statistics for the routing dataset.")
     parser.add_argument("--city", default="all")
     parser.add_argument("--output-dir", type=Path, default=Path("dataset_plots"))
     args = parser.parse_args()
+
     edges = fetch_edges(None if args.city == "all" else args.city)
     for city_id, city_edges in grouped_edges(edges).items():
         plot_city_summary(city_id, city_edges, args.output_dir)
         plot_city_distributions(city_id, city_edges, args.output_dir)
         print(f"{city_id}: plotted {len(city_edges):,} edges")
+
+    missingness_summary = compute_missingness_summary(edges)
+    plot_missingness_heatmap(missingness_summary, args.output_dir)
+    print_missingness_report(missingness_summary)
     print(f"Plots written to {args.output_dir.resolve()}")
 
 

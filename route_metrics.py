@@ -105,6 +105,19 @@ class GraphEdge:
     length_m: float
     features: Dict[str, Any]
     raw_tags: Dict[str, Any]
+    oneway: bool = False
+    node_ids: Tuple[int, ...] = ()
+    highway: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Keep routing topology separate from OSM tags so algorithm adapters
+        # can receive edges without access to raw_tags.
+        if not self.oneway:
+            self.oneway = str(self.raw_tags.get("oneway", "")).lower() in {"yes", "true", "1"}
+        if not self.node_ids:
+            self.node_ids = tuple(self.raw_tags.get("_node_ids", (self.start, self.end)))
+        if self.highway is None:
+            self.highway = self.raw_tags.get("highway")
 
 
 @dataclass
@@ -136,7 +149,7 @@ def edge_length_m(edge: GraphEdge, nodes: Dict[int, Tuple[float, float]]) -> flo
     if edge.length_m > 0:
         return edge.length_m
 
-    node_ids = edge.raw_tags.get("_node_ids", [edge.start, edge.end])
+    node_ids = edge.node_ids or (edge.start, edge.end)
     geometry = [nodes[node_id] for node_id in node_ids if node_id in nodes]
     return sum(
         haversine_m(first, second)
@@ -230,14 +243,21 @@ def load_graph(
 def nearest_node(
     nodes: Dict[int, Tuple[float, float]],
     point: Tuple[float, float],
+    valid_nodes: Optional[Iterable[int]] = None,
 ) -> int:
     if not nodes:
         raise ValueError("The selected area contains no nodes.")
-    return min(nodes, key=lambda node_id: haversine_m(nodes[node_id], point))
+    candidate_nodes = dict(nodes)
+    if valid_nodes is not None:
+        valid_ids = set(valid_nodes)
+        candidate_nodes = {node_id: coord for node_id, coord in nodes.items() if node_id in valid_ids}
+        if not candidate_nodes:
+            raise ValueError("No valid graph nodes are available for routing from the selected area.")
+    return min(candidate_nodes, key=lambda node_id: haversine_m(candidate_nodes[node_id], point))
 
 
 def is_oneway(edge: GraphEdge) -> bool:
-    return str(edge.raw_tags.get("oneway", "")).lower() in {"yes", "true", "1"}
+    return edge.oneway
 
 
 def get_incline(edge: GraphEdge) -> Tuple[Optional[float], str]:
@@ -259,7 +279,7 @@ def build_adjacency(
 ) -> Dict[int, List[Tuple[int, GraphEdge]]]:
     adjacency: Dict[int, List[Tuple[int, GraphEdge]]] = {}
     for edge in edges:
-        node_ids = edge.raw_tags.get("_node_ids", [edge.start, edge.end])
+        node_ids = edge.node_ids or (edge.start, edge.end)
         node_ids = [node_id for node_id in node_ids if node_id in nodes]
         for segment_index, (start, end) in enumerate(zip(node_ids, node_ids[1:])):
             segment = GraphEdge(
@@ -284,7 +304,7 @@ def classify_edge(edge: GraphEdge, profile: Dict[str, Any]) -> Dict[str, Any]:
     incline, incline_source = get_incline(edge)
     width = features.get("width_m")
     surface = features.get("surface")
-    stairs = features.get("stairs") is True or edge.raw_tags.get("highway") == "steps"
+    stairs = features.get("stairs") is True or edge.highway == "steps"
 
     violations: List[str] = []
     critical: List[str] = []
